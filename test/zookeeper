@@ -1,0 +1,157 @@
+package test.zookeeper;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooDefs.Ids;
+import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.data.Stat;
+
+public class DistributedLockByEdison implements Watcher{
+	private int threadId;
+	private ZooKeeper zk=null;
+	private String selfPath;
+	private String waitPath;
+	private String LOG_PREFIX_OF_THREAD;
+	private static final String GROUP_PATH="/root";
+	private static final String NODE_PATH="/root/node_";
+	private static final int SESSION_TIMEOUT=3000;
+	private static final String CONNECTION_PATH="127.0.0.1:2181";
+	private static final int THREAD_COUNT=10;
+	//确保zk连接成功，每个线程都需要一个，所以不设置成static final
+	private CountDownLatch connectionSemaphore=new CountDownLatch(1);
+	private static final CountDownLatch threadSemaphore=new CountDownLatch(THREAD_COUNT);
+	//构造函数
+	public DistributedLockByEdison(int id) {
+		// TODO Auto-generated constructor stub
+		this.threadId=id;
+		LOG_PREFIX_OF_THREAD = "第"+threadId+"个线程";
+	}
+	public static void main(String[] args) {
+		for(int i=0;i<THREAD_COUNT;i++){
+			int thread=i+1;
+			new Thread(){
+				public void run() {
+					DistributedLockByEdison dl=new DistributedLockByEdison(thread);
+					try {
+						//创建连接
+						dl.createConnection(CONNECTION_PATH, SESSION_TIMEOUT);
+						//用一个线程来创建根节点
+						synchronized (threadSemaphore) {
+							dl.creatPath(GROUP_PATH, "该节点由线程" + dl.threadId + "创建", true);
+						}
+						//节点获取锁
+						dl.getLock();
+					} catch (Exception e) {
+						// TODO Auto-generated catch block
+						e.printStackTrace();
+					}
+				};
+			}.start();
+		}
+		try {
+			threadSemaphore.await();
+			System.out.println("所以线程执行完毕");
+		} catch (InterruptedException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+	//获取锁成功后的执行计划
+	public void getLockSuccess() throws Exception{
+		System.out.println("线程"+this.threadId+"获取锁成功，开始红红火火,恍恍惚惚,6666,2333");
+		//模拟工作状态
+		Thread.sleep(1000);
+		//删除节点
+		zk.delete(selfPath, -1);
+		System.out.println("线程"+this.threadId+"自杀了");
+		//释放zk连接
+		if(zk!=null){
+			zk.close();
+			System.out.println("线程"+this.threadId+"释放连接");
+		}
+		threadSemaphore.countDown();
+	}
+	public void getLock() throws Exception{
+		selfPath=zk.create(NODE_PATH, null, Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+		System.out.println("线程"+this.threadId+"创建锁路径"+selfPath);
+		if(checkMinNode()){
+			getLockSuccess();
+		}
+	}
+	public boolean checkMinNode() throws Exception{
+		List<String> list = zk.getChildren(GROUP_PATH, false);
+		Collections.sort(list);
+		int index = list.indexOf( selfPath.substring(GROUP_PATH.length()+1));
+		switch (index) {
+		case -1:{
+			System.out.println("第"+this.threadId+"线程"+"本人已死，有事烧纸");
+			return false;
+		}
+		case 0:{
+			System.out.println("第"+this.threadId+"线程"+"本屌果然是最小的节点，红红火火,恍恍惚惚,6666,2333");
+			return true;
+		}
+		default:{
+			this.waitPath = GROUP_PATH +"/"+ list.get(index - 1);
+			System.out.println("第"+this.threadId+"线程"+"所有节点中,我前一个节点为"+this.waitPath);
+			//给前面的节点设置watcher
+			zk.getData(this.waitPath, true, new Stat());
+			return false;
+		}
+		}	
+	}
+	public boolean creatPath(String path,String data,boolean needWatcher) throws Exception{
+		if(zk.exists(path, needWatcher)==null){
+			System.out.println(
+					"节点创建成功, Path: "
+		                    + this.zk.create( path,
+		                    data.getBytes(),
+		                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
+		                    CreateMode.PERSISTENT )
+		                    + ", content: " + data
+					);
+		}
+		return true;
+	}
+	public void createConnection(String connection_path,int session_timeout) throws Exception{
+		zk=new ZooKeeper(connection_path, session_timeout, this);
+		connectionSemaphore.await();
+	}
+	//监听回调函数
+	@Override
+    public void process(WatchedEvent event) {
+        if(event == null){
+            return;
+        }
+        Event.KeeperState keeperState = event.getState();
+        Event.EventType eventType = event.getType();
+        if ( Event.KeeperState.SyncConnected == keeperState) {
+            if ( Event.EventType.None == eventType ) {
+                System.out.println( LOG_PREFIX_OF_THREAD + "成功连接上ZK服务器" );
+                connectionSemaphore.countDown();
+            }else if (event.getType() == Event.EventType.NodeDeleted && event.getPath().equals(waitPath)) {
+                System.out.println(LOG_PREFIX_OF_THREAD + "收到情报，排我前面的家伙已挂，我是不是可以出山了？");
+                 try {
+                    if(checkMinNode()){
+                        getLockSuccess();
+                    }
+                }  catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }else if ( Event.KeeperState.Disconnected == keeperState ) {
+            System.out.println( LOG_PREFIX_OF_THREAD + "与ZK服务器断开连接" );
+        } else if ( Event.KeeperState.AuthFailed == keeperState ) {
+            System.out.println( LOG_PREFIX_OF_THREAD + "权限检查失败" );
+        } else if ( Event.KeeperState.Expired == keeperState ) {
+            System.out.println( LOG_PREFIX_OF_THREAD + "会话失效" );
+        }
+    }
+	
+}
